@@ -1,0 +1,10 @@
+# Nothing here is shipped except what package.json's `files` lists, plus the
+# sources of the plugin itself. `lib/` IS committed on purpose: a git install
+# gets the repository as-is and no build step runs, so the built bundle has to
+# be in the tree.
+node_modules/
+*.tgz
+artifacts/
+
+.DS_Store
+*.log

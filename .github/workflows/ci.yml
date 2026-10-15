@@ -1,0 +1,21 @@
+# `lib/` is committed because a git install runs no build step — a stale bundle
+# is the one defect a user cannot see, so CI refuses to let the tree drift.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # No dependencies to install: the build is plain Node.
+      - name: The committed bundle must match src/
+        run: node tools/build.mjs --check
+      - name: Smoke-test the built bundle
+        run: node --test tests/*.mjs

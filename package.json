@@ -1,0 +1,63 @@
+{
+  "name": "dsh-plugin-sidebar-tabs",
+  "version": "0.1.0",
+  "description": "浏览器式右侧栏标签管理：批量关闭、浮出/收回、重新打开已关闭的标签、标签总览面板",
+  "type": "module",
+  "license": "MIT",
+  "author": "Neil Ji",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sidebar",
+    "tabs"
+  ],
+  "homepage": "https://github.com/neil-ji/dsh-plugin-sidebar-tabs#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neil-ji/dsh-plugin-sidebar-tabs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/neil-ji/dsh-plugin-sidebar-tabs/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/en.json": "./locale/en.json",
+    "./locale/zh.json": "./locale/zh.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "node tools/build.mjs --check",
+    "test": "node --test tests/*.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-shortcuts",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

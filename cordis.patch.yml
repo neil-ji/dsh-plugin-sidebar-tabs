@@ -1,0 +1,4 @@
+# Add only our own plugin row; no official DSH component is replaced.
+- insert:
+    - id: sidebar-tabs
+      name: dsh-plugin-sidebar-tabs
