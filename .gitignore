@@ -8,3 +8,12 @@ artifacts/
 
 .DS_Store
 *.log
+
+# Never commit local credentials, even by accident.
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+.netrc
+.npmrc
