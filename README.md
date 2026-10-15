@@ -57,6 +57,11 @@ error: profile "desktop" is managed exclusively by the Electron application
 
 插件没有安装期脚本（没有 `prepare` / `postinstall`），安装只是复制文件。
 
+安装日志里会出现一条 `[WARN] Issues with peer dependencies found`，可以忽略：本包声明了
+`@deepseek-ai/cordis` 的 peer 范围，而 profile 的 `pnpm-workspace.yaml` 设了
+`autoInstallPeers: false`——cordis 由基座组合包提供，不需要再装一份。这只是 pnpm 的提示，
+不影响安装；真正的兼容性判定由安装器单独做，peer 不满足时会**直接拒绝安装**而不是装上坏插件。
+
 ## 开发
 
 零依赖：仓库里没有打包器、没有 `node_modules`、没有安装期脚本。
@@ -111,9 +116,17 @@ window.__ModuleLoader__.load({ id: 'dsh-plugin-sidebar-tabs', factory: function 
 
 ### 已知的元数据缓存
 
-`clientModules` 会把每个包解析出的 `dsh.client` 声明缓存到宿主重启为止。所以改
-`package.json` 的 `dsh.client.inject` / `platform` 之后，要么重启应用，要么重新安装一次；
-只改 `lib/*.js` 的内容不受这个缓存影响。
+`clientModules` 把每个包解析出的 `dsh.client` 声明——**包括 `lib/client.js` 的绝对路径**——缓存到
+宿主（桌面端就是应用进程）重启为止。所以：
+
+- 改 `package.json` 的 `dsh.client.inject` / `platform`：要重启才生效。
+- **换安装来源**（例如把本地 `link:` 换成 git 安装）：profile 的依赖记录变了，但那个缓存的产物
+  路径还是旧的。只要旧路径仍然存在（git 安装不会动你的开发目录），一切看起来正常，**实际服务的
+  却还是旧目录里的文件**；删掉旧目录则会让插件的客户端半边在重启前失效。
+- 只改 `lib/*.js` 的内容不受这个缓存影响：revision 每 500ms 从入口产物的 `mtime/ctime/size` 重算，
+  所以就地编辑会被 HMR 替换掉。
+
+全新安装不涉及这一点——路径是第一次解析，本来就指向安装副本。
 
 ## 设计要点（以及为什么有些事做不到）
 
