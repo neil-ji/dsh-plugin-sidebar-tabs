@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-sidebar-tabs",
   "version": "0.1.0",
-  "description": "浏览器式右侧栏标签管理：批量关闭、浮出/收回、重新打开已关闭的标签、标签总览面板",
+  "description": "浏览器式右侧栏标签管理：批量关闭、浮出/收回、重新打开已关闭的标签、标签总览面板；并为右侧栏文件预览补上视频/音频内联播放",
   "type": "module",
   "license": "MIT",
   "author": "Neil Ji",
@@ -10,7 +10,10 @@
     "dsh-plugin",
     "deepseek-harness",
     "sidebar",
-    "tabs"
+    "tabs",
+    "video",
+    "media",
+    "preview"
   ],
   "homepage": "https://github.com/neil-ji/dsh-plugin-sidebar-tabs#readme",
   "repository": {
@@ -56,6 +59,7 @@
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-shortcuts",
         "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
         "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }

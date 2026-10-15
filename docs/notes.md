@@ -14,6 +14,11 @@ README 只讲怎么用。这里是给 fork / 改代码的人看的：用了哪�
 | 浮出 / 收回 | `ctx.sidebarRight` 的 `float(tabId)` / `dock(paneId)` |
 | 键盘命令 | `ctx.shortcuts.register({ … resolve })` |
 | 文案 | `ctx.locale.register(ns, { zh, en })` + `bind(ns)` |
+| 文件预览追加渲染器 | `ctx.documentPreviews.register({ id, extensions, priority, title, loading })` |
+| 该渲染器的正文 | `sidebar.right.tab.document`（keyed 席位，key = 注册的 id） |
+| 媒体字节流 | `ctx.webServer.register({ kind, path, handler })`（Host 半） |
+| 读文件字节 | `ctx.workspaceFiles.readBytes(scope, path, { offset, length }, signal)`（Host 半） |
+| 会话 → 工作区根 | `ctx.typert.lookups.get('workspaceFileScope').resolve(sessionId)` |
 
 ## 三个实现要点
 
@@ -69,9 +74,9 @@ README 只讲怎么用。这里是给 fork / 改代码的人看的：用了哪�
 零依赖：没有打包器、没有 `node_modules`、没有安装期脚本。
 
 ```bash
-npm run build   # src/host.js -> lib/index.js，src/client.js -> lib/client.js
+npm run build   # src/host/client.js + src/host/media-*.js -> lib/index.js，src/client.js -> lib/client.js
 npm run check   # 产物与 src/ 不一致时 exit 1
-npm test        # 在 Node 里用桩件加载产物并驱动 apply()
+npm test        # 在 Node 里用桩件加载产物并驱动 apply()；另含 token / Range / 路由往返
 ```
 
 `src/client.js` **不是一个模块**，而是一段"工厂函数体"：`tools/build.mjs` 把它包进
@@ -90,11 +95,66 @@ window.__ModuleLoader__.load({ id: 'dsh-plugin-sidebar-tabs', factory: function 
 
 | 产物 | 是什么 |
 |---|---|
-| `lib/index.js` | Host 半边。只有一个空的 `apply`：它存在只是让 profile 有一行可挂载，从而让 `dsh.client` 被扫进客户端模块图。 |
-| `lib/client.js` | 浏览器半边，真正的功能。 |
+| `lib/index.js` | Host 半边：媒体预览的两条 HTTP 路由。标签管理那半边不需要 Host 参与，但没有这一行就没有 `dsh.client` 可扫，客户端半边不会被加载。 |
+| `lib/client.js` | 浏览器半边：标签管理 + 媒体渲染器注册 + 播放器正文。 |
 
 `lib/` **提交进仓库**是刻意的：git 安装拿到的是仓库原样，不跑任何构建步骤。也正因为如此，CI 跑
 `npm run check`——过期的 bundle 是用户看不见的那种缺陷。
+
+## 媒体预览是怎么接上的
+
+官方预览包 `@deepseek-ai/dsh-client-ui-sidebar-documentpreview` 把"按后缀挑渲染器"做成了公开
+注册表：`ctx.documentPreviews.register(...)` 只登记元数据，正文另外注册到 keyed 席位
+`sidebar.right.tab.document`，key 就是元数据的 `id`。排序是 **extension 段 > builtin 段，
+然后后缀更长优先**，所以外部插件的 `extension` 注册天然压过内置的纯文本兜底——mp4 不用改
+DSH 本体就从"当文本读然后失败"变成"按视频播"。
+
+正文渲染器会收到 `{ resourceAddress, content, wrap, scrollportRef }`。`content` 的类型由元数据的
+`loading` 决定：
+
+- `text-pages`：累积的文本前缀（Markdown / 代码 / 纯文本用）；
+- `bytes-complete`：整份文件的字节。
+
+**两条路都不能用来放视频**：`bytes-complete` 走 `remote.workspaceFiles.readAll`，默认上限
+`maxFileBytes = 32 MiB`，超了直接 `too-large` 失败，而且整份文件以 base64 过线；没有 Range，
+也就没有 seek。所以媒体渲染器声明 `bytes-complete`（席位要求一个模式）却**完全不看 `content`**，
+真正的字节走 Host 半的流式路由。
+
+### Host 半：签名 URL + Range
+
+```text
+POST /api/sidebar-tabs/media/sign     { sessionId, path } -> { url, mediaType, bytes }
+GET  /api/sidebar-tabs/media/stream?token=…   bytes，支持 Range / 206 / 416 / HEAD
+```
+
+`<video>` 不能带 `Authorization` 头，所以授权只能放进 URL。token 是
+`base64url(payload) + "." + HMAC-SHA256(payload)`，payload 里是 `{ session, path, exp, nonce }`，
+密钥每个 Host 进程随机生成一次。篡改会打掉签名，重启会让所有旧地址失效。`nonce` 保证同一个文件
+两次请求拿到不同的 URL，不会撞上媒体缓存。
+
+读文件不自己开 `node:fs`，而是回到官方的 `workspaceFiles`：
+
+```js
+const scope = await ctx.typert.lookups.get('workspaceFileScope').resolve(sessionId);
+const window = await ctx.workspaceFiles.readBytes(scope, path, { offset, length }, signal);
+```
+
+这样**读权限、沙箱策略、相对路径怎么解析**都由 DSH 决定，插件只负责分页和写响应。`readBytes`
+返回的是 base64 窗口，`bytes` 字段给出文件总大小（用它做 `Content-Length`）。
+
+### 字节窗口上限是"发现"出来的，不是假设的
+
+`maxBytes`（默认 2 MiB）是 workspace-files 那一行的配置，插件读不到，而且**超限是抛
+`workspace-file/too-large` 拒绝，不是截断**。所以路由第一窗从 1 MiB 试起，被拒就减半，直到
+`MIN_CHUNK_BYTES`；成功的宽度在整条响应里沿用。`tests/host-media.mjs` 里的假件照搬了"拒绝而不是
+截断"的语义，所以这个自适应逻辑是真被跑过的。
+
+### 为什么 `lib/` 必须自包含
+
+git 安装不跑构建步骤，仓库里有什么就装什么。所以 `tools/build.mjs` 把 `src/host/media-*.js`
+**内联**进 `lib/index.js`：每个模块变成一个返回自身导出的 IIFE，`import` 语句被提到文件顶部
+（`import` 是模块级声明，留在 IIFE 里是语法错误）。内联模块因此只允许 `node:` 内置导入，构建脚本
+会拦下别的东西。这样做的好处是 `files` 列表、单个 tarball、或只拷 `lib/` 的部署都不会缺文件。
 
 ## 踩过的坑
 

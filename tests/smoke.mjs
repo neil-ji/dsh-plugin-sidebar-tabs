@@ -124,6 +124,8 @@ function makeContext({ sessionId = 's1', tabs = [], target } = {}) {
     slots: [],
     types: [],
     shortcuts: [],
+    previews: [],
+    injections: [],
     closed: [],
     focused: [],
     opened: [],
@@ -218,6 +220,23 @@ function makeContext({ sessionId = 's1', tabs = [], target } = {}) {
         return () => {};
       },
     },
+    /**
+     * Mirror Cordis's `ctx.inject(deps, callback)`: run the callback now, in a
+     * child context, and record the dependency names it parked on. The real
+     * implementation re-runs the callback whenever a dependency changes and
+     * disposes its effects in between, so returning a disposer here is what
+     * makes a test able to model an unload.
+     */
+    inject(deps, callback) {
+      record.injections.push({ deps, callback });
+      return callback(ctx);
+    },
+    documentPreviews: {
+      register: (definition) => {
+        record.previews.push(definition);
+        return () => {};
+      },
+    },
   };
 
   return { ctx, record, sidebar, openTabs, records, sessionId };
@@ -265,6 +284,50 @@ test('apply registers the menu seat, the tab type, its body and the copy namespa
   assert.equal(record.locale[0].ns, 'sidebarTabs');
   assert.ok(record.locale[0].dicts.zh['menu.closeOthers']);
   assert.ok(record.locale[0].dicts.en['menu.closeOthers']);
+});
+
+test('the media renderer registers a document preview and its keyed body', () => {
+  const plugin = loadPlugin();
+  const { ctx, record } = makeContext();
+  plugin.apply(ctx);
+
+  // It parks on the shipped document preview rather than assuming it.
+  const parked = record.injections.find((entry) => Array.isArray(entry.deps) && entry.deps.includes('documentPreviews'));
+  assert.ok(parked, 'the media half must wait for ctx.documentPreviews');
+
+  assert.equal(record.previews.length, 1);
+  const preview = record.previews[0];
+  assert.equal(preview.id, 'dsh-plugin-sidebar-tabs/media');
+  assert.equal(preview.priority, 'extension');
+  assert.equal(preview.loading, 'bytes-complete');
+  assert.ok(preview.extensions.includes('mp4'));
+  assert.ok(preview.extensions.includes('mp3'));
+
+  const body = record.slots.find((entry) => entry.definition.name === 'sidebar.right.tab.document');
+  assert.ok(body, 'the media body seat must be occupied');
+  assert.equal(body.definition.key, 'dsh-plugin-sidebar-tabs/media');
+  assert.equal(typeof body.Component, 'function');
+});
+
+test('every namespaced literal in the client source is a real copy key', () => {
+  const plugin = loadPlugin();
+  const { ctx, record } = makeContext();
+  plugin.apply(ctx);
+  const source = fs.readFileSync(path.join(root, 'src/client.js'), 'utf8');
+  // The `t('…')` scan above misses keys chosen by a ternary, so this asserts the
+  // weaker but wider property: a literal shaped like a copy key must be one.
+  // Command ids are dotted too (`sidebarTabs.closeOthers`), hence the allow list.
+  const COPY_NAMESPACES = ['menu', 'manager', 'command', 'media'];
+  const candidates = new Set(
+    [...source.matchAll(/'([a-z][a-zA-Z]*\.[a-zA-Z][a-zA-Z0-9]*)'/g)]
+      .map((match) => match[1])
+      .filter((key) => COPY_NAMESPACES.includes(key.slice(0, key.indexOf('.')))),
+  );
+  assert.ok(candidates.size > 20, 'the scan must find the plugin’s copy keys at all');
+  for (const dict of [record.locale[0].dicts.zh, record.locale[0].dicts.en]) {
+    const missing = [...candidates].filter((key) => !(key in dict));
+    assert.deepEqual(missing, [], `missing copy keys: ${missing.join(', ')}`);
+  }
 });
 
 test('the copy namespace covers exactly the keys the plugin renders', () => {
