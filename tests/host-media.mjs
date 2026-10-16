@@ -373,9 +373,39 @@ test('the row config sets the signed-URL lifetime, and nonsense falls back', asy
   assert.ok((await lifetimeOf({ mediaTokenTtlMs: -1 })) > 6 * 60 * 60 * 1000 - 5_000, 'a nonsense lifetime must fall back');
 });
 
-test('disposal unregisters both routes', async () => {
+test('the status route reports what the media routes were asked to do', async () => {
+  const host = await startHost({ files: { '/workspace/media/clip.mp4': FILE_BYTES, '/workspace/media/notes.md': Buffer.from('# hi') } });
+  try {
+    const signed = await sign(host.base, { sessionId: 's1', path: 'media/clip.mp4' });
+    await (await fetch(`${host.base}${signed.payload.url}`, { headers: { Range: 'bytes=0-99' } })).arrayBuffer();
+    const refused = await sign(host.base, { sessionId: 's1', path: 'media/notes.md' });
+
+    const status = await fetch(`${host.base}/api/sidebar-tabs/media/status`);
+    assert.equal(status.status, 200);
+    const report = await status.json();
+    // Counters make a stalled player diagnosable: a browser that never asked for
+    // bytes shows up as `stream: 0`, one that asked and was refused shows up in
+    // `refused` with the reason.
+    assert.ok(report.counts.sign >= 1, 'every successful sign is counted');
+    assert.equal(report.counts.signFailed, 1, 'only the refused sign is a failure');
+    assert.ok(report.counts.refused >= 1, 'a refused suffix is counted');
+    assert.equal(report.counts.stream >= 1, true, 'the range request is counted');
+    const streams = report.entries.filter((entry) => entry.kind === 'stream');
+    assert.equal(streams[0].range, 'bytes=0-99');
+    assert.equal(streams[0].from, 0);
+    assert.equal(streams[0].to, 99);
+    // It must never leak a path or a token.
+    assert.equal(JSON.stringify(report).includes('/workspace/'), false, 'the report must not carry file paths');
+    assert.equal(JSON.stringify(report).includes('token='), false, 'the report must not carry tokens');
+    assert.equal(refused.status, 415);
+  } finally {
+    await host.close();
+  }
+});
+
+test('disposal unregisters every route', async () => {
   const host = await startHost({ files: { '/workspace/media/clip.mp4': FILE_BYTES } });
-  assert.equal(host.routes.length, 2);
+  assert.equal(host.routes.length, 3);
   await host.close();
   assert.equal(host.routes.length, 0);
 });
