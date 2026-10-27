@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-sidebar-tabs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "浏览器式右侧栏标签管理：批量关闭、浮出/收回、重新打开已关闭的标签、标签总览面板；并为右侧栏文件预览补上视频/音频内联播放",
   "type": "module",
   "license": "MIT",

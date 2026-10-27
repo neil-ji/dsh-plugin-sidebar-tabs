@@ -4,8 +4,9 @@
  * The unit tests cover the token and the range grammar in isolation; this drives
  * the routes the way a browser does — a real `node:http` server, real requests,
  * real response bodies — against a fake `ctx` whose `workspaceFiles` service
- * serves one in-memory file through the same base64 byte-window contract the
- * shipped service uses.
+ * serves one in-memory file through the same contract the shipped service uses:
+ * native bytes, `{ range: { offset, length } }` windows, and a complete-file form
+ * that is capped.
  *
  * What it protects: the sign/stream handshake, `Range` seeking, the byte count of
  * what actually arrives, and every refusal (bad token, expired token, missing
@@ -24,6 +25,15 @@ for (let index = 0; index < FILE_BYTES.length; index += 1) FILE_BYTES[index] = (
 
 /** The byte-window cap the shipped service applies, mirrored so chunking is exercised. */
 const MAX_WINDOW = 4096;
+
+/**
+ * The complete-file cap the shipped service applies (`maxFileBytes`).
+ *
+ * Deliberately far below any file these tests serve: the media routes must never
+ * take the complete-file form, and shrinking the cap is what turns that rule into
+ * a loud failure instead of a slow one.
+ */
+const MAX_FILE = 1024;
 
 /**
  * Build a fake Host context that registers the plugin's routes on a real server.
@@ -45,12 +55,17 @@ async function startHost({ files, sessions = ['s1'], config } = {}) {
 
   const scope = { sessionId: 's1', workspaceRoot: '/workspace' };
   const workspaceFiles = {
-    async readBytes(_scope, path, range, signal) {
+    async readBytes(_scope, path, options, signal) {
       const absolutePath = path.startsWith('/') ? path : `/workspace/${path}`;
       const data = files[absolutePath];
+      // The shipped signature is `readBytes(scope, path, { range?, baseFile? })`.
+      // No `range` means "the whole file", and that form — not the windowed one —
+      // is what the complete-file cap applies to.
+      const range = options?.range;
+      const complete = range === undefined;
       const offset = range?.offset ?? 0;
-      const length = range?.length ?? MAX_WINDOW;
-      const record = { path, range, offset, length, refused: false, aborted: signal?.aborted === true };
+      const length = complete ? (data?.length ?? 0) : (range.length ?? MAX_WINDOW);
+      const record = { path, range: range ?? null, complete, offset, length, refused: false, aborted: signal?.aborted === true };
       if (data === undefined) {
         calls.push(record);
         const error = new Error(`no such file: ${absolutePath}`);
@@ -60,22 +75,25 @@ async function startHost({ files, sessions = ['s1'], config } = {}) {
       // The shipped service refuses an oversized window instead of shortening it;
       // mirroring that refusal is what proves the route adapts rather than
       // silently reading the wrong bytes.
-      if (length > MAX_WINDOW) {
+      const cap = complete ? MAX_FILE : MAX_WINDOW;
+      if (length > cap) {
         record.refused = true;
         calls.push(record);
-        const error = new Error(`${length} bytes exceed the ${MAX_WINDOW} byte cap`);
+        const error = new Error(`${length} bytes exceed the ${cap} byte cap`);
         error.code = 'workspace-file/too-large';
-        error.limit = MAX_WINDOW;
+        error.limit = cap;
         throw error;
       }
       calls.push(record);
-      const window = data.subarray(offset, offset + length);
+      const window = complete ? data : data.subarray(offset, offset + length);
       return {
         absolutePath,
         version: 'v1',
         bytes: data.length,
         offset,
-        data: window.toString('base64'),
+        // Native bytes, as the in-process service returns them; base64 is only
+        // the spelling the generated Client applies on the wire.
+        data: Buffer.from(window),
         eof: offset + window.length >= data.length,
       };
     },
@@ -215,6 +233,28 @@ test('a range request answers 206 with exactly the requested window', async () =
   }
 });
 
+test('every read is a byte window, never a complete file', async () => {
+  const host = await startHost({ files: { '/workspace/media/clip.mp4': FILE_BYTES } });
+  try {
+    const signed = await sign(host.base, { sessionId: 's1', path: 'media/clip.mp4' });
+    assert.equal(signed.status, 200);
+    await (await fetch(`${host.base}${signed.payload.url}`, { headers: { Range: 'bytes=0-9' } })).arrayBuffer();
+
+    assert.ok(host.calls.length > 0);
+    for (const call of host.calls) {
+      // `{ offset, length }` on the options object is not a window: the service
+      // ignores it and reads the complete file, which the cap refuses above
+      // `maxFileBytes` and which the media routes must never ask for.
+      assert.notEqual(call.range, null, 'a read without `range` asks for the whole file');
+      assert.equal(call.complete, false);
+    }
+    // The size probe is the narrowest window there is.
+    assert.equal(host.calls[0].length, 1);
+  } finally {
+    await host.close();
+  }
+});
+
 test('a suffix range serves the tail, so a player can read a trailing index', async () => {
   const host = await startHost({ files: { '/workspace/media/clip.mp4': FILE_BYTES } });
   try {
@@ -269,6 +309,7 @@ test('the stream adapts to the service window cap and pages through the file', a
     assert.ok(served.length > 1, 'the route must page through the file, not ask for it whole');
     for (const call of served) assert.ok(call.length <= MAX_WINDOW, `window ${call.length} exceeds the cap`);
     for (const call of served) assert.equal(call.aborted, false);
+    for (const call of served) assert.equal(call.complete, false, 'a complete read would be refused above the file cap');
     // Every served window starts where the stream had reached, in order.
     const covers = served.map((call) => `${call.offset}-${call.offset + call.length}`).join(' ');
     assert.ok(covers.startsWith('0-'), `the stream must start at zero: ${covers}`);

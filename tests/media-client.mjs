@@ -30,7 +30,14 @@ const region = (() => {
  * @returns the pure decisions that region exports, plus its id and suffix list.
  */
 function loadMediaRegion() {
-  const react = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }), useMemo: (fn) => fn(), useState: (value) => [value, () => {}], useEffect: () => {} };
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
+    useMemo: (fn) => fn(),
+    useRef: (value) => ({ current: value }),
+    useCallback: (fn) => fn,
+    useState: (value) => [value, () => {}],
+    useEffect: () => {},
+  };
   const factory = new Function(
     'React',
     'h',
@@ -56,7 +63,10 @@ const media = loadMediaRegion();
  */
 function makeInteractiveReact() {
   let states = [];
-  let ranEffects = [];
+  let refs = [];
+  let memos = [];
+  let effectDeps = [];
+  let effectCleanups = [];
   let cleanups = [];
   let renderCount = 0;
   let rendering = false;
@@ -65,7 +75,28 @@ function makeInteractiveReact() {
 
   const react = {
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
-    useMemo: (fn) => fn(),
+    // Memoized on its dependency list, like React: an identity that changed every
+    // render would restart the media body's request on every render.
+    useMemo(fn, deps) {
+      const slot = index;
+      index += 1;
+      const previous = memos[slot];
+      if (previous !== undefined && sameDeps(previous.deps, deps)) return previous.value;
+      const value = fn();
+      memos[slot] = { deps: deps === undefined ? undefined : [...deps], value };
+      return value;
+    },
+    // A ref is one slot, created once and then handed back on every render, which
+    // is exactly what the body relies on to reach the latest content handle from
+    // a promise started by an earlier render.
+    useRef(initial) {
+      const slot = index;
+      index += 1;
+      if (!(slot in refs)) refs[slot] = { current: initial };
+      return refs[slot];
+    },
+    // Identity is not observed here: the body only needs a stable-enough function.
+    useCallback: (fn) => fn,
     useState(initial) {
       const slot = index;
       index += 1;
@@ -83,15 +114,20 @@ function makeInteractiveReact() {
         },
       ];
     },
-    useEffect(fn) {
-      // A mounted component runs an effect once; the media body re-runs its own
-      // effect only when its dependencies change, which this harness models by
-      // mounting a new component instead.
-      const runSlot = `effect${index}`;
+    useEffect(fn, deps) {
+      const slot = index;
       index += 1;
-      if ((ranEffects[runSlot] ??= false)) return;
-      ranEffects[runSlot] = true;
+      const previous = effectDeps[slot];
+      // An effect with no dependency list runs once per mount here; one with a
+      // list re-runs when the list changes, which is what a retry is: a new
+      // attempt value must restart the request, not be ignored.
+      if (deps === undefined && previous !== undefined) return;
+      if (sameDeps(previous, deps)) return;
+      const previousCleanup = effectCleanups[slot];
+      if (typeof previousCleanup === 'function') previousCleanup();
+      effectDeps[slot] = deps === undefined ? [] : [...deps];
       const cleanup = fn();
+      effectCleanups[slot] = typeof cleanup === 'function' ? cleanup : undefined;
       if (typeof cleanup === 'function') cleanups.push(cleanup);
     },
   };
@@ -110,7 +146,10 @@ function makeInteractiveReact() {
      */
     mount(Component, props) {
       states = [];
-      ranEffects = [];
+      refs = [];
+      memos = [];
+      effectDeps = [];
+      effectCleanups = [];
       cleanups = [];
       renderCount = 0;
       rendered = undefined;
@@ -154,10 +193,39 @@ function makeFetch(answer) {
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 /**
+ * Shallow dependency comparison, the rule React applies to `useMemo` and
+ * `useEffect` alike. Without it a memoized value is a fresh object every render,
+ * which re-runs an effect that depends on it — the exact loop the body avoids by
+ * memoizing the parsed address.
+ * @param previous - the dependency list of the earlier run.
+ * @param next - the dependency list of this run.
+ * @returns whether React would reuse the earlier result.
+ */
+function sameDeps(previous, next) {
+  if (previous === undefined || next === undefined) return false;
+  return previous.length === next.length && previous.every((value, at) => Object.is(value, next[at]));
+}
+
+/**
  * Render the media body in the interactive harness.
  * @param options - address, fetch answer, and locale.
  * @returns the live element getter, the unmount hook, and the recorded fetches.
  */
+/** A content handle shaped like the one the preview hands a `renderer`-mode body. */
+function contentHandle(reported) {
+  return {
+    kind: 'renderer',
+    revision: 0,
+    reload: () => {},
+    loaded: () => {
+      reported.loaded += 1;
+    },
+    failed: () => {
+      reported.failed += 1;
+    },
+  };
+}
+
 function renderBody({ resourceAddress, answer, t = (key, params) => (params === undefined ? `«${key}»` : `«${key}:${JSON.stringify(params)}»`) }) {
   const harness = makeInteractiveReact();
   const fetchStub = makeFetch(answer);
@@ -171,12 +239,13 @@ function renderBody({ resourceAddress, answer, t = (key, params) => (params === 
     `${region}\nreturn { MediaBody };`,
   );
   const { MediaBody } = factory(harness.react, harness.react.createElement, 'dsh-plugin-sidebar-tabs', 'sidebarTabs', fetchStub.fetch, { info: () => {}, warn: () => {} });
+  const reported = { loaded: 0, failed: 0 };
   const mounted = harness.mount(MediaBody, {
-    content: { kind: 'bytes', data: new Uint8Array(0) },
+    content: contentHandle(reported),
     resourceAddress,
     t,
   });
-  return { live: mounted.live, renders: mounted.renders, unmount: mounted.unmount, calls: fetchStub.calls };
+  return { live: mounted.live, renders: mounted.renders, unmount: mounted.unmount, calls: fetchStub.calls, reported };
 }
 
 /** Collect every element of one type from a rendered tree. */
@@ -191,7 +260,7 @@ test('the media renderer registers through the public document-preview registry'
   assert.equal(definition.id, 'dsh-plugin-sidebar-tabs/media');
   // The extension band is what takes these suffixes away from the plain-text fallback.
   assert.equal(definition.priority, 'extension');
-  assert.equal(definition.loading, 'bytes-complete');
+  assert.equal(definition.loading, 'renderer');
   assert.equal(definition.wrap, false);
   assert.equal(definition.title(), 'Video');
 });
@@ -266,7 +335,7 @@ test('the tab label is the file name, not the path', () => {
 
 test('a body without a usable address reports itself unsupported', () => {
   const rendered = media.MediaBody({
-    content: { kind: 'bytes', data: new Uint8Array(0) },
+    content: contentHandle({ loaded: 0, failed: 0 }),
     resourceAddress: 'dsh-resource://file/absolute/tmp/clip.mp4',
     t: (key) => `«${key}»`,
   });
@@ -276,7 +345,7 @@ test('a body without a usable address reports itself unsupported', () => {
 
 test('a known suffix renders a player element rather than a byte window', () => {
   const rendered = media.MediaBody({
-    content: { kind: 'bytes', data: new Uint8Array(0) },
+    content: contentHandle({ loaded: 0, failed: 0 }),
     resourceAddress: 'dsh-resource://file/session/s1/media/clip.mp4',
     t: (key) => `«${key}»`,
   });
@@ -289,7 +358,7 @@ test('a known suffix renders a player element rather than a byte window', () => 
 
 test('an audio suffix takes the audio branch', () => {
   const rendered = media.MediaBody({
-    content: { kind: 'bytes', data: new Uint8Array(0) },
+    content: contentHandle({ loaded: 0, failed: 0 }),
     resourceAddress: 'dsh-resource://file/session/s1/media/song.mp3',
     t: (key) => `«${key}»`,
   });
@@ -349,6 +418,54 @@ test('a transport failure is reported rather than left loading forever', async (
   });
   await settle();
   assert.match(JSON.stringify(body.live()), /"data-media-state":"failed"/u);
+  body.unmount();
+});
+
+test('the body reports its own load to the preview', async () => {
+  const ready = renderBody({
+    resourceAddress: 'dsh-resource://file/session/s1/media/clip.mp4',
+    answer: { ok: true, json: async () => ({ url: '/stream?token=x' }) },
+  });
+  await settle();
+  // A `renderer`-mode body owns its source, so it is the one that says the load
+  // is over; otherwise the preview shows it as pending for the tab's lifetime.
+  assert.equal(ready.reported.loaded, 1);
+  assert.equal(ready.reported.failed, 0);
+  ready.unmount();
+
+  const refused = renderBody({
+    resourceAddress: 'dsh-resource://file/session/s1/media/gone.mp4',
+    answer: { ok: false, status: 404, json: async () => ({ error: 'unreadable', detail: 'workspace-file/not-found' }) },
+  });
+  await settle();
+  assert.equal(refused.reported.failed, 1);
+  assert.equal(refused.reported.loaded, 0);
+  refused.unmount();
+});
+
+test('a player that cannot decode the stream says why and offers a retry', async () => {
+  const body = renderBody({
+    resourceAddress: 'dsh-resource://file/session/s1/media/clip.mkv',
+    answer: { ok: true, json: async () => ({ url: '/stream?token=x' }) },
+  });
+  await settle();
+  const [player] = elementsOfType(body.live(), 'video');
+  assert.ok(player, 'a ready body renders the player first');
+  player.props.onError();
+  await settle();
+
+  const flat = JSON.stringify(body.live());
+  assert.match(flat, /"data-media-state":"unplayable"/u);
+  assert.match(flat, /media\.playbackFailed/u);
+  assert.equal(elementsOfType(body.live(), 'video').length, 0, 'a dead player gives way to the reason');
+
+  const before = body.calls.length;
+  const [retry] = elementsOfType(body.live(), 'button');
+  assert.ok(retry, 'the failure state must offer a retry');
+  retry.props.onClick();
+  await settle();
+  assert.equal(body.calls.length, before + 1, 'a retry re-signs instead of reloading the tab');
+  assert.match(JSON.stringify(body.live()), /"data-media-state":"ready"/u);
   body.unmount();
 });
 

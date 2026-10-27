@@ -92,6 +92,8 @@ const ZH = {
   'media.opening': '正在打开媒体…',
   'media.unsupported': '这个扩展名没有可用的媒体播放器。',
   'media.failed': '无法播放这个文件。',
+  'media.playbackFailed': '播放器无法解码这个文件：容器或编码不受支持，转成 mp4 / webm 后可以内联播放。',
+  'media.retry': '重试',
   'media.audioLabel': '音频播放器：{name}',
   'media.videoLabel': '视频播放器：{name}',
 };
@@ -139,6 +141,8 @@ const EN = {
   'media.opening': 'Opening media…',
   'media.unsupported': 'No media player is registered for this extension.',
   'media.failed': 'This file could not be played.',
+  'media.playbackFailed': 'The player cannot decode this file: unsupported container or codec. Converting it to mp4 / webm makes it play inline.',
+  'media.retry': 'Retry',
   'media.audioLabel': 'Audio player: {name}',
   'media.videoLabel': 'Video player: {name}',
 };
@@ -165,8 +169,9 @@ const CSS = `
 .dsh-st-sep{height:1px;margin:8px 0;background:var(--dsw-alias-border-l1)}
 .dsh-st-media{position:relative;display:flex;box-sizing:border-box;align-items:center;justify-content:center;width:100%;min-height:120px;padding:8px}
 .dsh-st-mediaFrame{box-sizing:border-box;max-width:100%;margin:0;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md,8px);background:#000}
-.dsh-st-mediaStatus{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;color:var(--dsw-alias-label-secondary);font-size:12px;text-align:center}
+.dsh-st-mediaStatus{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:16px;color:var(--dsw-alias-label-secondary);font-size:12px;text-align:center}
 .dsh-st-media[data-media-state="ready"] .dsh-st-mediaStatus{display:none}
+.dsh-st-mediaRetry{padding:2px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}
 .dsh-st-mediaAudio{display:flex;align-items:center;justify-content:center;width:100%;padding:16px}
 .dsh-st-mediaAudio .dsh-st-mediaFrame{width:100%;background:transparent}
 `;
@@ -1034,20 +1039,41 @@ async function requestMediaUrl(sessionId, path, signal) {
 /**
  * The media document body.
  *
- * It owns no loading itself: the Host streams the file to the element, which
- * asks for the byte ranges it wants and can seek without ever buffering the
- * whole file. That is also why this renderer declares `bytes-complete` loading
- * and then ignores the prepared content — the seat requires a load mode, and the
- * shared byte window is exactly what it must not use.
- * @param props - document address, prepared content, and locale.
- * @returns a native player, or a status line.
+ * The bytes come from the Host's signed stream route, never from the preview's
+ * prepared content: that route answers ranged requests, so the element seeks
+ * without buffering the file, and it has no complete-file cap to run into. That
+ * is why the renderer registers in the `renderer` loading mode: the preview then
+ * mounts this body before reading anything and leaves the source to it. Under
+ * `bytes-complete` the preview would first read the whole file through a read
+ * capped at `maxFileBytes` (32 MiB by default) and only mount a body once that
+ * read succeeded — so every movie over the cap had no player at all, while every
+ * movie under it waited for bytes this body does not use.
+ *
+ * `content` is therefore bookkeeping, not data: `loaded` reports that this body
+ * has its source, `failed` reports that it does not.
+ * @param props - the preview's content handle, document address, and locale.
+ * @returns a native player, or a status line naming the reason.
  */
 function MediaBody({ content, resourceAddress, t }) {
   const file = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
   const path = file?.path;
   const mediaType = path === undefined ? undefined : mediaTypeOf(path);
   const isAudio = mediaType !== undefined && mediaType.startsWith('audio/');
+  const [attempt, setAttempt] = React.useState(0);
   const [view, setView] = React.useState({ revision: 0, state: { kind: 'loading' } });
+  // The preview recreates its content handle on every render, so the effect below
+  // must not depend on it; a ref keeps the newest handle reachable from a promise.
+  const handle = React.useRef(content);
+  handle.current = content;
+  /** The preview's own reload counter; it changes when the toolbar reloads. */
+  const sourceRevision = content?.revision;
+  const retry = React.useCallback(() => setAttempt((value) => value + 1), []);
+  /** A player that cannot decode the stream, as opposed to one that got no URL. */
+  const unplayable = React.useCallback(() => {
+    setView((previous) =>
+      previous.state.kind === 'unplayable' ? previous : { revision: previous.revision, state: { kind: 'unplayable' } },
+    );
+  }, []);
 
   React.useEffect(() => {
     if (file === undefined || mediaType === undefined) return undefined;
@@ -1070,19 +1096,28 @@ function MediaBody({ content, resourceAddress, t }) {
       .then((result) => {
         if (!current) return;
         revision += 1;
-        if (result.ok) publish({ kind: 'ready', url: result.url });
-        else publish({ kind: 'failed', detail: result.detail });
+        if (result.ok) {
+          publish({ kind: 'ready', url: result.url });
+          // No version to report: this body does not track the file's version,
+          // and claiming one the metadata frame disagrees with turns the
+          // preview's change detection into a reload loop.
+          handle.current?.loaded?.();
+        } else {
+          publish({ kind: 'failed', detail: result.detail });
+          handle.current?.failed?.();
+        }
       })
       .catch((error) => {
         if (!current || error?.name === 'AbortError') return;
         revision += 1;
         publish({ kind: 'failed', detail: String(error?.message ?? error) });
+        handle.current?.failed?.();
       });
     return () => {
       current = false;
       controller.abort();
     };
-  }, [file, mediaType]);
+  }, [file, mediaType, attempt, sourceRevision]);
 
   const source = view.state;
 
@@ -1099,15 +1134,19 @@ function MediaBody({ content, resourceAddress, t }) {
           playsInline: true,
           preload: 'metadata',
           'aria-label': t(isAudio ? 'media.audioLabel' : 'media.videoLabel', { name }),
+          onError: unplayable,
         })
       : undefined;
 
   const status =
     source.kind === 'loading'
       ? t('media.opening')
-      : source.kind === 'failed'
-        ? `${t('media.failed')} (${source.detail})`
-        : undefined;
+      : source.kind === 'unplayable'
+        ? t('media.playbackFailed')
+        : source.kind === 'failed'
+          ? `${t('media.failed')} (${source.detail})`
+          : undefined;
+  const retryable = source.kind === 'failed' || source.kind === 'unplayable';
 
   // The status line is keyed by state so a new attempt remounts it rather than
   // reusing a node the browser may already have hidden.
@@ -1121,14 +1160,21 @@ function MediaBody({ content, resourceAddress, t }) {
     element,
     status === undefined
       ? undefined
-      : h('p', { className: 'dsh-st-mediaStatus', role: source.kind === 'failed' ? 'alert' : 'status' }, status),
+      : h(
+          'p',
+          { className: 'dsh-st-mediaStatus', role: retryable ? 'alert' : 'status' },
+          status,
+          retryable
+            ? h('button', { type: 'button', className: 'dsh-st-mediaRetry', onClick: retry }, t('media.retry'))
+            : undefined,
+        ),
   );
 }
 
 /**
  * Describe the media renderer independently from its keyed body slot.
  * @param title - locale-owned implementation name.
- * @returns metadata for complete media files.
+ * @returns metadata for self-loading media files.
  */
 function mediaDefinition(title) {
   return {
@@ -1136,7 +1182,11 @@ function mediaDefinition(title) {
     extensions: MEDIA_SUFFIXES,
     priority: 'extension',
     title,
-    loading: 'bytes-complete',
+    // `renderer` = "this body loads its own source". `bytes-complete` would make
+    // the preview read the whole file first, capped at 32 MiB and useless to a
+    // ranged player: the body never mounted above the cap and never needed the
+    // bytes below it.
+    loading: 'renderer',
     wrap: false,
   };
 }

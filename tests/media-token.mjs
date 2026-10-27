@@ -134,8 +134,13 @@ test('the advertised extension list matches the media table', () => {
   assert.ok(MEDIA_EXTENSIONS.includes('mp3'));
 });
 
-test('base64 windows decode to their original bytes', () => {
+test('a byte window keeps its bytes, whichever shape it arrives in', () => {
   const original = Buffer.from([0x00, 0xff, 0x10, 0x7f]);
   assert.deepEqual(bytesOf(original.toString('base64')), original);
+  // The in-process service returns native bytes, and treating those as base64
+  // text is what turned every streamed byte into garbage.
+  assert.deepEqual(bytesOf(original), original);
+  assert.deepEqual(bytesOf(new Uint8Array(original)), original);
+  assert.deepEqual(bytesOf(original.buffer.slice(original.byteOffset, original.byteOffset + original.length)), original);
   assert.equal(bytesOf('').length, 0);
 });

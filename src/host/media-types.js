@@ -46,10 +46,21 @@ export function mediaTypeOf(path) {
 }
 
 /**
- * Decode the base64 window a Host byte read returns.
- * @param data - base64 text from the workspace-files service.
+ * Take the raw bytes out of one `workspaceFiles.readBytes` window.
+ *
+ * The in-process service hands back native bytes, not text: `base64` is only the
+ * spelling it uses on the wire, and only the generated Client decodes it. Reading
+ * a `Uint8Array` through `String(data)` produces a string of decimal numbers and
+ * commas, and base64-decoding *that* produces a buffer of the right order of
+ * magnitude with none of the content — a media element then sees a container it
+ * cannot parse, for every file, at every size. The text branch stays for callers
+ * that were handed a wire-shaped payload.
+ * @param data - a `Uint8Array`, an `ArrayBuffer`, or base64 text.
  * @returns the raw bytes.
  */
 export function bytesOf(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof Uint8Array) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
   return Buffer.from(String(data), 'base64');
 }

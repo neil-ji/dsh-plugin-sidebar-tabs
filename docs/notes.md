@@ -110,15 +110,22 @@ window.__ModuleLoader__.load({ id: 'dsh-plugin-sidebar-tabs', factory: function 
 DSH 本体就从"当文本读然后失败"变成"按视频播"。
 
 正文渲染器会收到 `{ resourceAddress, content, wrap, scrollportRef }`。`content` 的类型由元数据的
-`loading` 决定：
+`loading` 决定，而**预览会按 `content` 决定挂不挂载正文**：
 
 - `text-pages`：累积的文本前缀（Markdown / 代码 / 纯文本用）；
-- `bytes-complete`：整份文件的字节。
+- `bytes-complete`：整份文件的字节；`content` 在整份读成功之前一直是 `undefined`；
+- `renderer`：正文自己取源。预览只发一个 `content` 句柄（`loaded()` / `failed()` / `reload`），
+  挂载与否不看任何读操作。
 
-**两条路都不能用来放视频**：`bytes-complete` 走 `remote.workspaceFiles.readAll`，默认上限
-`maxFileBytes = 32 MiB`，超了直接 `too-large` 失败，而且整份文件以 base64 过线；没有 Range，
-也就没有 seek。所以媒体渲染器声明 `bytes-complete`（席位要求一个模式）却**完全不看 `content`**，
-真正的字节走 Host 半的流式路由。
+**视频只能走 `renderer`**。`bytes-complete` 走 `remote.workspaceFiles.readAll`，默认上限
+`maxFileBytes = 32 MiB`，超了直接 `too-large` 失败；而预览的正文槽是 `content !== undefined &&`
+才渲染的，所以**超过上限的文件连播放器都挂不出来**——不是播放失败，是根本没有节点。小于上限的文件
+则会先白读一遍整份字节（这一半完全不用），再挂播放器。
+
+`renderer` 模式下正文要自己收尾：拿到签名 URL 后调 `content.loaded()`（不传版本号——传一个和元数据
+不一致的版本号会把预览的“文件变了”判定变成重载循环），取源失败调 `content.failed()`。
+
+真正的字节走 Host 半的流式路由，一律 `Range`、一律窗口读。
 
 ### Host 半：签名 URL + Range
 
@@ -136,11 +143,16 @@ GET  /api/sidebar-tabs/media/stream?token=…   bytes，支持 Range / 206 / 416
 
 ```js
 const scope = await ctx.typert.lookups.get('workspaceFileScope').resolve(sessionId);
-const window = await ctx.workspaceFiles.readBytes(scope, path, { offset, length }, signal);
+const window = await ctx.workspaceFiles.readBytes(scope, path, { range: { offset, length } }, signal);
 ```
 
 这样**读权限、沙箱策略、相对路径怎么解析**都由 DSH 决定，插件只负责分页和写响应。`readBytes`
-返回的是 base64 窗口，`bytes` 字段给出文件总大小（用它做 `Content-Length`）。
+返回的 `data` 是**原生字节**（`Uint8Array`），不是 base64——base64 只出现在 wire 上、由生成的
+Client 解码；`bytes` 字段给出文件总大小（用它做 `Content-Length`）。
+
+窗口形状必须是 `{ range: { offset, length } }`。传 `{ offset, length }` 不会报错，它会被当成
+"没有 range"，也就是**整份文件的读**：走 `maxFileBytes` 上限、每个窗口请求都把整个文件读一遍。
+这个形状差异没有任何类型检查兜底，只有 `tests/host-media.mjs` 的假件按真实契约实现时才暴露。
 
 ### 字节窗口上限是"发现"出来的，不是假设的
 
@@ -157,6 +169,26 @@ git 安装不跑构建步骤，仓库里有什么就装什么。所以 `tools/bu
 会拦下别的东西。这样做的好处是 `files` 列表、单个 tarball、或只拷 `lib/` 的部署都不会缺文件。
 
 ## 踩过的坑
+
+### 媒体预览的三处"能跑通测试但放不出画面"
+
+这三个缺陷各自独立、都能让视频完全播不出来，而且都在 `npm test` 里是绿的——因为当时的假件把错误
+假设也一起照搬了。三处都按真实契约改了，假件现在按真服务的行为写（原生字节、`range` 形状、两层
+上限、拒绝而不是截断），所以回归会在测试里就崩。
+
+1. **窗口形状**：`readBytes(scope, path, { offset, length })` 不报错，但被当成整份文件的读。真实
+   服务对整份读施加上限 `maxFileBytes = 32 MiB`，超过直接 `too-large`；没超过则每个窗口请求都把
+   整个文件读一遍，`Content-Length` 声明的是窗口长度、实际写的是整份字节，浏览器拿到的响应立刻
+   就错位。正确形状是 `{ range: { offset, length } }`。
+2. **字节来源**：进程内服务返回 `Uint8Array`，不是 base64。用 `Buffer.from(String(data), 'base64')`
+   去解一个 `Uint8Array`，得到的是同数量级的垃圾字节——容器头都没了，播放器只会报解码失败。
+   `bytesOf` 现在按 `Buffer` / `Uint8Array` / `ArrayBuffer` / base64 文本四路分派。
+3. **加载模式**：`bytes-complete` 会让预览先读完整个文件再挂载正文。超上限时正文永远不挂载
+   （连播放器节点都没有），没超上限时白读一遍。媒体渲染器因此改成 `renderer` 模式，正文自己取源。
+
+排查这三处的顺序也记一下：先看 Host 的 `GET /api/sidebar-tabs/media/status`（有没有 `sign` /
+`stream` 计数，说明浏览器到底问没问过字节），再拿签名 URL 直接 `curl` 一次比对首字节，最后才怀疑
+前端。首字节不对就是 Host 的两处之一，`sign: 0` 则是正文根本没挂载。
 
 ### `ctx.effect` 的回调必须返回函数
 

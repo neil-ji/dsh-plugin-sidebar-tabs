@@ -186,7 +186,16 @@ export function apply(ctx, config) {
     if (scope === undefined) return { error: 'unknown-session' };
     let window;
     try {
-      window = await ctx.workspaceFiles.readBytes(scope, path, { offset: 0, length: 1 }, new AbortController().signal);
+      // A byte window, not a complete read: `readBytes` applies `maxFileBytes`
+      // (32 MiB by default) to the complete form and refuses anything larger, so
+      // the size probe and the stream would both fail on exactly the files this
+      // half exists for. The window cap `maxBytes` is the one that applies here.
+      window = await ctx.workspaceFiles.readBytes(
+        scope,
+        path,
+        { range: { offset: 0, length: 1 } },
+        new AbortController().signal,
+      );
     } catch (error) {
       return { error: 'unreadable', detail: error?.code ?? String(error?.message ?? error) };
     }
@@ -290,8 +299,13 @@ export function apply(ctx, config) {
 
           const controller = new AbortController();
           res.on('close', () => controller.abort());
+          // The options shape is the service's, not this plugin's: a window is
+          // `{ range: { offset, length } }`. Passing `{ offset, length }` asks for
+          // the *complete* file instead — refused above `maxFileBytes` and, below
+          // it, one whole file per request instead of one window, which is what
+          // made every streamed byte arrive with the container's offsets lost.
           const readWindow = (offset, length) =>
-            ctx.workspaceFiles.readBytes(scope, verdict.path, { offset, length }, controller.signal);
+            ctx.workspaceFiles.readBytes(scope, verdict.path, { range: { offset, length } }, controller.signal);
 
           // Commit no response head until the size is known.
           let first;
@@ -327,7 +341,10 @@ export function apply(ctx, config) {
             method: req.method,
             name: verdict.path.split('/').pop(),
             range: range ?? null,
-            status: window === undefined ? 416 : 206,
+            // The status the response will carry: a plain whole-file request is a
+            // 200, and reporting it as 206 made the journal misdescribe the very
+            // case worth diagnosing.
+            status: window === undefined ? 416 : range === undefined ? 200 : 206,
             from: window?.start ?? null,
             to: window?.end ?? null,
           });

@@ -48,7 +48,8 @@ dsh plugin --profile web add https://github.com/neil-ji/dsh-plugin-sidebar-tabs
 
 官方预览包（`@deepseek-ai/dsh-client-ui-sidebar-documentpreview`）把「按后缀选渲染器」做成了公开
 注册表，但自带的完整字节通道有上限——`readAll` 默认 32 MiB，且走 base64，PDF 和截图够用，电影
-不够用，也没有 seek。所以本插件的媒体播放不走那条路：
+不够用，也没有 seek。所以本插件既不声明 `bytes-complete`（那会让预览先读完整个文件再挂载正文），
+也不用那条通道：渲染器声明 `renderer` 加载模式，正文自己取源，字节只从 Host 的流式路由来。
 
 - **Host 半**在 `webServer` 上注册两条路由：`POST /api/sidebar-tabs/media/sign` 为「会话 + 文件」
   签发一个 HMAC 签名、带过期时间的 URL；`GET /api/sidebar-tabs/media/stream?token=…` 按 `Range`
@@ -58,7 +59,7 @@ dsh plugin --profile web add https://github.com/neil-ji/dsh-plugin-sidebar-tabs
 - 播放器只是一个原生 `<video controls>` / `<audio controls>`，地址是那条签名 URL。
 
 限制：默认流地址有效期 6 小时（`mediaTokenTtlMs` 可调）；`mkv` / `avi` 能否真的播出取决于容器
-里的编码，Chromium 认不出来的编码只会报一个播放失败，不会回退成别的东西。
+里的编码，Chromium 认不出来的编码会显示一句「播放器无法解码这个文件」和重试按钮，不会静默卡住。
 
 ## 效果展示
 

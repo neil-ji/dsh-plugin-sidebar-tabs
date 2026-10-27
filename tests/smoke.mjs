@@ -299,7 +299,7 @@ test('the media renderer registers a document preview and its keyed body', () =>
   const preview = record.previews[0];
   assert.equal(preview.id, 'dsh-plugin-sidebar-tabs/media');
   assert.equal(preview.priority, 'extension');
-  assert.equal(preview.loading, 'bytes-complete');
+  assert.equal(preview.loading, 'renderer');
   assert.ok(preview.extensions.includes('mp4'));
   assert.ok(preview.extensions.includes('mp3'));
 
